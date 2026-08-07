@@ -1,0 +1,26 @@
+{
+	auto_https off
+	admin off
+}
+
+(vllm_proxy) {
+	@authorized {
+		header Authorization "Bearer {env.CADDY_API_KEY}"
+	}
+
+	handle @authorized {
+		reverse_proxy 127.0.0.1:9001 {
+			header_up Host {http.reverse_proxy.upstream.hostport}
+			header_up X-Forwarded-Proto https
+		}
+	}
+
+	handle {
+		respond "Unauthorized" 401
+	}
+}
+
+https://:9002 {
+	tls /workspace/caddy-cert.pem /workspace/caddy-key.pem
+	import vllm_proxy
+}
