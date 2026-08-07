@@ -268,7 +268,9 @@ def chart_specs(records):
         ChartSpec(
             "itl",
             "Inter-token latency",
-            "Gap between successive output tokens once generation is under way.",
+            "Gap between successive deliveries of output tokens once generation is under "
+            "way. One delivery is one engine step, which under speculative decoding hands "
+            "over several tokens at once -- see 'mean tokens per step'.",
             "s",
             [
                 SeriesSpec("Mean", histogram_stat("vllm:inter_token_latency_seconds", "mean")),
@@ -560,6 +562,12 @@ def load_profile(records):
     whenever long prompts are being prefilled -- prefill produces no output tokens -- so
     a dip can mean "long prompts", not "saturated". Decode speed comes from inter-token
     latency, which is only measured between output tokens, so prefill cannot depress it.
+
+    Decode speed is tokens divided by the *sum* of the inter-token gaps: tokens per
+    request-second actually spent decoding. It used to be 1/mean(gap), which is only the
+    same thing when a step emits exactly one token. Under speculative decoding a step
+    emits every token the draft got right -- ~4 here -- and vLLM records one gap per
+    step, not one per token, so 1/mean(gap) was steps per second and read ~4x low.
     """
     bins = {}
     for record in records:
@@ -569,14 +577,42 @@ def load_profile(records):
             continue
         entry = bins.setdefault(concurrency_bin(running), {"rates": [], "decode": []})
 
-        rate = record.get("counters", {}).get("vllm:generation_tokens_total", 0.0) / interval
-        if rate > 0:
-            entry["rates"].append(rate)
+        tokens = record.get("counters", {}).get("vllm:generation_tokens_total", 0.0)
+        if tokens > 0:
+            entry["rates"].append(tokens / interval)
 
         latency = record.get("histograms", {}).get("vllm:inter_token_latency_seconds", {})
-        if latency.get("mean"):
-            entry["decode"].append(1.0 / latency["mean"])
+        if tokens > 0 and latency.get("sum"):
+            entry["decode"].append(tokens / latency["sum"])
     return bins
+
+
+def acceptance_length(records):
+    """Output tokens per engine step under speculative decoding, None when it is off.
+
+    Worth reporting on its own: it is both the speedup the drafter is buying and the
+    factor by which any steps-per-second figure understates tokens per second.
+    """
+    drafts = sum_counter(records, "vllm:spec_decode_num_drafts_total")
+    if not drafts:
+        return None
+    return 1 + sum_counter(records, "vllm:spec_decode_num_accepted_tokens_total") / drafts
+
+
+def per_request_decode_rate(records):
+    """Output tokens per second as one caller experiences them, across the whole run.
+
+    Total tokens over the total time spent decoding them, so it is weighted by decode
+    time rather than being an average of per-interval averages -- a handful of idle
+    intervals cannot drag it around.
+    """
+    seconds = sum(
+        record.get("histograms", {}).get("vllm:inter_token_latency_seconds", {}).get("sum", 0.0)
+        for record in records
+    )
+    if not seconds:
+        return None
+    return sum_counter(records, "vllm:generation_tokens_total") / seconds
 
 
 def concurrency_time(records):
@@ -663,6 +699,8 @@ def summarise(records, prompts, generations, latency):
     queries = sum_counter(records, "vllm:prefix_cache_queries_total")
     hits = sum_counter(records, "vllm:prefix_cache_hits_total")
     occupancy = mean_of(records, gpu_stat("utilization_percent"))
+    acceptance = acceptance_length(records)
+    decode_rate = per_request_decode_rate(records)
     statuses = status_totals(records)
     served = sum(statuses.values())
     failed = sum(count for status, count in statuses.items() if not status.startswith("2"))
@@ -690,6 +728,10 @@ def summarise(records, prompts, generations, latency):
          format_duration_value(distribution_quantile(*latency, 0.99)), ""),
         ("Mean inter-token latency", format_duration_value(
             histogram_mean(records, "vllm:inter_token_latency_seconds")), ""),
+        ("Mean tokens per step", f"{acceptance:.2f}" if acceptance is not None else "--", ""),
+        ("Mean per-request decode rate",
+         f"{decode_rate:.0f}" if decode_rate is not None else "--",
+         "tok/s" if decode_rate is not None else ""),
         ("Mean queue time", format_duration_value(
             histogram_mean(records, "vllm:request_queue_time_seconds")), ""),
         ("Peak KV cache usage",
@@ -1642,11 +1684,13 @@ def main():
             profile_bars(
                 profile, "decode", "load-decode",
                 "Decode speed per request against load",
-                "Output tokens per second that one request sees, derived from inter-token "
-                "latency, so unlike the chart above it is not depressed by prefill. This is "
-                "the speed a caller feels. Concurrency is not the only thing driving it — "
-                "attention cost grows with context length — so bins mixing short and long "
-                "prompts are not comparable. To read a clean curve, load one context size.",
+                "Output tokens per second that one request sees: tokens divided by the time "
+                "actually spent decoding them, so unlike the chart above it is not depressed "
+                "by prefill. This is the speed a caller feels. Tokens accepted from the "
+                "draft model count, because the caller receives them. Concurrency is not the "
+                "only thing driving it — attention cost grows with context length — so bins "
+                "mixing short and long prompts are not comparable. To read a clean curve, "
+                "load one context size.",
                 "tokens/s each",
             ),
         )
