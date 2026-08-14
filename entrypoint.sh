@@ -52,10 +52,12 @@ SESSION_VLLM=vllm
 SESSION_CADDY=caddy
 SESSION_METRICS=metrics
 SESSION_TAILSCALE=tailscale
+SESSION_SSH_TUNNEL=ssh-tunnel
 LOG_VLLM=/workspace/vllm.log
 LOG_CADDY=/workspace/caddy.log
 LOG_METRICS=/workspace/metrics.log
 LOG_TAILSCALE=/workspace/tailscale.log
+LOG_SSH_TUNNEL=/workspace/ssh-tunnel.log
 METRICS=/workspace/metrics.jsonl
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -66,7 +68,7 @@ while [ -e "$ARCHIVE" ]; do
     ARCHIVE="/workspace/archive/$STAMP-$attempt"
 done
 
-for file in "$LOG_VLLM" "$LOG_CADDY" "$LOG_METRICS" "$LOG_TAILSCALE" "$METRICS"; do
+for file in "$LOG_VLLM" "$LOG_CADDY" "$LOG_METRICS" "$LOG_TAILSCALE" "$LOG_SSH_TUNNEL" "$METRICS"; do
     if [ -f "$file" ]; then
         mkdir -p "$ARCHIVE"
         mv -- "$file" "$ARCHIVE/"
@@ -78,7 +80,7 @@ if [ -d "$ARCHIVE" ]; then
     echo "Archived the previous run to $ARCHIVE"
 fi
 
-tail -n 0 -F "$LOG_VLLM" "$LOG_CADDY" "$LOG_METRICS" &
+tail -n 0 -F "$LOG_VLLM" "$LOG_CADDY" "$LOG_METRICS" "$LOG_SSH_TUNNEL" &
 
 echo "Launching vLLM under screen..."
 screen -dmS "$SESSION_VLLM" bash with-logging.sh "$LOG_VLLM" bash "$LAUNCH_SCRIPT"
@@ -91,6 +93,11 @@ fi
 if [ -n "${TS_AUTHKEY:-}" ]; then
     echo "Launching Tailscale under screen..."
     screen -dmS "$SESSION_TAILSCALE" bash with-logging.sh "$LOG_TAILSCALE" bash launch-tailscale.sh
+fi
+
+if [ -n "${SSH_TUNNEL_HOST:-}" ]; then
+    echo "Launching the reverse SSH tunnel under screen..."
+    screen -dmS "$SESSION_SSH_TUNNEL" bash with-logging.sh "$LOG_SSH_TUNNEL" bash launch-ssh-tunnel.sh
 fi
 
 echo "Launching the metrics collector under screen..."

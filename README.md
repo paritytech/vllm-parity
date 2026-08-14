@@ -16,6 +16,10 @@ $ docker push $USERNAME/vllm-parity:$VERSION
 - `CADDY_API_KEY` (optional) -- the API key required to access the vLLM instance publicly (arbitrary, you generate this yourself) through the exposed HTTPS reverse proxy; proxy doesn't start at all when not set
 - `TS_AUTHKEY` (optional) -- the auth key to automatically join a Tailscale network (only if you want to use Tailscale); Tailscale doesn't start at all when not set
 - `TS_HOSTNAME` (optional) -- the hostname with which to join a Tailscale network
+- `SSH_TUNNEL_HOST` (optional) -- the host to open a persistent reverse SSH tunnel to; passed to `ssh` as-is, so `host`, `user@host` and `ssh://user@host:2222` all work; the tunnel doesn't start at all when not set
+- `SSH_TUNNEL_REMOTE_VLLM_PORT` (optional) -- the port (or interface address *and* port, separated by a colon) to open on the remote host, forwarded straight to vLLM (bypassing the Caddy proxy, so no API key is checked)
+- `SSH_TUNNEL_PRIVATE_KEY` (optional) -- the private SSH key to authenticate to that host with, base64-encoded (a raw PEM works too); must not have a passphrase
+- `SSH_TUNNEL_HOST_KEY` (optional) -- the remote's public host key, so that it doesn't have to be trusted on first connect; when not set the first connection's key is remembered and required afterwards
 - `DEBUG_KEEP_CONTAINER_ALIVE` (optional) -- when set to `1` will not exit when an error is encountered and/or the vLLM process is stopped
 - `DEBUG_EXPOSE_VLLM_PUBLICLY` (optional, UNSAFE) -- when set to `1` the vLLM process will listen on `0.0.0.0:9001` instead of `127.0.0.1:9001`
 
@@ -71,7 +75,7 @@ $ curl -k https://localhost:10002/v1/chat/completions -H "Authorization: Bearer 
 
 # Setting up a Runpod template
 
-Add your SSH key to `authorized_keys`. Then build and upload the image.
+Add your SSH key to `authorized_keys` (if you want to connect to the pod through SSH). Then build and upload the image.
 
 (Optional, but highly recommended): if you don't have a HuggingFace token: install HuggingFace CLI on your PC with `uv tool install hf`, then run `hf auth login`, then print out your token with `hf auth token`.
 
@@ -86,6 +90,10 @@ Then create a new template on Runpod:
     - Add `CADDY_API_KEY` (optional); generate a random key with `openssl rand -hex 32` (should also be saved as a secret)
     - Add `TS_AUTHKEY` (optional) if you want to connect through Tailscale (should also be saved as a secret)
     - Add `TS_HOSTNAME` (optional) if you want it to have a preset hostname by default on your Tailscale network
+    - Add `SSH_TUNNEL_HOST` (optional) if you want to create a reverse SSH tunnel for the vLLM instance directly; will connect to this address through SSH
+    - Add `SSH_TUNNEL_HOST_KEY` (optional) the public key of the remote host
+    - Add `SSH_TUNNEL_REMOTE_VLLM_PORT` (optional) with the port on which vLLM will be accessible on the *remote* host
+    - Add `SSH_TUNNEL_PRIVATE_KEY` (optional) a private key encoded through `base64 -w0`, so that the remote host can authorize the pod (should also be saved as a secret)
 - Networking configuration (TCP ports):
     - Label "SSH", port "53267" (it's running on a non-standard port to not get spammed by automated Internet-wide scans in case it gets directly exposed)
     - Label "vLLM Caddy Proxy", port "9002" (optional, add only if you've set the `CADDY_API_KEY` environment variable)
@@ -96,6 +104,10 @@ So, for example, assuming you named the secrets `HF_TOKEN` and `CADDY_API_KEY` y
 MODEL = smollm2-135m-instruct
 HF_TOKEN = {{ RUNPOD_SECRET_HF_TOKEN }}
 CADDY_API_KEY = {{ RUNPOD_SECRET_CADDY_API_KEY }}
+SSH_TUNNEL_HOST = tunnel@vps.example.com
+SSH_TUNNEL_HOST_KEY = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA
+SSH_TUNNEL_REMOTE_VLLM_PORT = 9101
+SSH_TUNNEL_PRIVATE_KEY = {{ RUNPOD_SECRET_SSH_TUNNEL_PRIVATE_KEY }}
 ```
 
 Important: on Runpod you should only use the exposed Caddy proxy server for one-off access! Runpod's networking is not very good, so it's not appropriate to use directly in production.
