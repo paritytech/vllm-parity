@@ -8,6 +8,17 @@ TOTAL_RAM=$(cat /sys/fs/cgroup/memory.max)
 KV_CACHE_CPU_OFFLOAD_SIZE=$((TOTAL_RAM / 10 * 5)) # 50% is KV cache
 DATA_PARALLEL_COUNT=$(( $GPU_COUNT < 2 ? 1 : $GPU_COUNT / 2 ))
 
+BLACKWELL_GPU_COUNT=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | grep -cE '^(10|12)\.' || true)
+FP4_INDEXER_CACHE_ARGS=()
+if (( BLACKWELL_GPU_COUNT == GPU_COUNT )); then
+    FP4_INDEXER_CACHE_ARGS=(--attention_config.use_fp4_indexer_cache=True)
+    FP4_INDEXER_CACHE_DECISION="enabled"
+else
+    FP4_INDEXER_CACHE_DECISION="disabled"
+fi
+
+echo "Blackwell GPUs detected: $BLACKWELL_GPU_COUNT of $GPU_COUNT; FP4 indexer cache: $FP4_INDEXER_CACHE_DECISION"
+
 mkdir -p /workspace/kv_cache
 
 exec bash ./launch-template.sh \
@@ -35,7 +46,7 @@ exec bash ./launch-template.sh \
             }]
         }
     }" \
-    --attention_config.use_fp4_indexer_cache=True \
+    "${FP4_INDEXER_CACHE_ARGS[@]}" \
     --enable-expert-parallel \
     --data-parallel-size $DATA_PARALLEL_COUNT \
     --kv-cache-dtype fp8 \
