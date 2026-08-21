@@ -66,6 +66,7 @@ exec bash ./launch-template.sh \
         \"kv_connector\": \"OffloadingConnector\",
         \"kv_role\": \"kv_both\",
         \"kv_connector_extra_config\":{
+            \"spec_name\": \"TieringOffloadingSpec\",
             \"cpu_bytes_to_use\": $KV_CACHE_CPU_OFFLOAD_SIZE,
             \"blocks_per_chunk\": 4,
             \"eviction_policy\": \"lru\",
