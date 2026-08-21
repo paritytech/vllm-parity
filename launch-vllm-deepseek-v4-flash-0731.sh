@@ -85,7 +85,9 @@ exec bash ./launch-template.sh \
     --gpu-memory-utilization "0.$GPU_MEMORY_UTILIZATION_PERCENT" \
     --kv-cache-dtype fp8 \
     --block-size 256 \
+    --max-num-seqs 64 \
     --max-num-batched-tokens 8192 \
+    --long-prefill-token-threshold 2048 \
     --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}' \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE", "custom_ops":["all"]}' \
     "$@"
