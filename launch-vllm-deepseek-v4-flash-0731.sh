@@ -35,9 +35,16 @@ if (( TENSOR_PARALLEL_COUNT == 0 )); then
 fi
 
 DATA_PARALLEL_COUNT=$(( GPU_COUNT / TENSOR_PARALLEL_COUNT ))
-KV_CACHE_CPU_OFFLOAD_SIZE=$(( TOTAL_RAM / 10 * 5 / DATA_PARALLEL_COUNT )) # 50% is KV cache
+
+SHM_FREE=$(df --block-size=1 --output=avail /dev/shm | tail -n1)
+KV_CACHE_CPU_OFFLOAD_TOTAL=$(( TOTAL_RAM / 10 * 5 )) # 50% is KV cache
+if (( KV_CACHE_CPU_OFFLOAD_TOTAL > SHM_FREE / 100 * 99 )); then
+    KV_CACHE_CPU_OFFLOAD_TOTAL=$(( SHM_FREE / 100 * 99 ))
+fi
+KV_CACHE_CPU_OFFLOAD_SIZE=$(( KV_CACHE_CPU_OFFLOAD_TOTAL / DATA_PARALLEL_COUNT ))
 
 echo "GPUs: $GPU_COUNT x $(( GPU_MEMORY_MIB / 1024 )) GiB; tensor parallel: $TENSOR_PARALLEL_COUNT, data parallel: $DATA_PARALLEL_COUNT, GPU memory utilization: 0.$GPU_MEMORY_UTILIZATION_PERCENT"
+echo "KV cache CPU offload: $(( KV_CACHE_CPU_OFFLOAD_SIZE / 1024 / 1024 / 1024 )) GiB per replica, out of $(( SHM_FREE / 1024 / 1024 / 1024 )) GiB free in /dev/shm"
 
 BLACKWELL_GPU_COUNT=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | grep -cE '^(10|12)\.' || true)
 FP4_INDEXER_CACHE_ARGS=()
