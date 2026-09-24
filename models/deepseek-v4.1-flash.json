@@ -1,0 +1,54 @@
+{
+  "hf_repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"},
+  "generation_config": {"top_p": 0.95},
+  "gpu_memory": {"startup_headroom_gib": 18, "max_utilization": 0.90},
+  "parallelism": {
+    "weights_gib": 476,
+    "host_weights_gib": 189,
+    "runtime_overhead_gib": 10,
+    "min_kv_cache_gib": 8
+  },
+  "default_engine": "sglang-2026-09-17-84cba45bf",
+  "validated_engines": ["sglang-2026-09-17-84cba45bf"],
+  "engine_args": {
+    "vllm": {
+      "args": {
+        "--safetensors-load-strategy": "prefetch_window",
+        "--enable-auto-tool-choice": true,
+        "--tokenizer-mode": "deepseek_v41",
+        "--tool-call-parser": "deepseek_v41",
+        "--reasoning-parser": "deepseek_v41",
+        "--max-model-len": 1048576,
+        "--max-num-seqs": 128,
+        "--max-num-batched-tokens": 16384,
+        "--max-cudagraph-capture-size": 1024,
+        "--speculative-config": {
+          "method": "dspark",
+          "num_speculative_tokens": 5,
+          "draft_sample_method": "probabilistic",
+          "rejection_sample_method": "block",
+          "enable_adaptive_verification": true
+        }
+      },
+      "env": {"VLLM_ENGINE_READY_TIMEOUT_S": 3600}
+    },
+    "sglang": {
+      "args": {
+        "--mem-fraction-static": "0.80",
+        "--hicache-size": null,
+        "--hicache-ratio": 2,
+        "--tool-call-parser": "deepseekv41",
+        "--reasoning-parser": "deepseek-v41",
+        "--context-length": 1048576,
+        "--max-running-requests": 128,
+        "--chunked-prefill-size": 4096,
+        "--cuda-graph-max-bs-decode": 64,
+        "--speculative-algorithm": "DSPARK",
+        "--speculative-dspark-block-size": 5
+      },
+      "env": {"SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": 1},
+      "parallelism": {"expert_parallel": true}
+    }
+  }
+}

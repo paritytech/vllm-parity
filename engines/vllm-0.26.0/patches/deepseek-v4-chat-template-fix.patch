@@ -1,0 +1,30 @@
+--- a/vllm/tokenizers/deepseek_v4.py
++++ b/vllm/tokenizers/deepseek_v4.py
+@@ -37,8 +37,25 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+             conversation = kwargs.get("conversation", messages)
+             messages = conversation.copy()
+             if tools is not None and len(tools) > 0:
+-                messages.insert(0, {"role": "system"})
+-                messages[0]["tools"] = tools  # type: ignore[typeddict-unknown-key]
++                # The encoder reads tools off a system message and renders them
++                # after its content. Only synthesize one when the request has
++                # none, otherwise the schemas precede the caller's system
++                # prompt. Matches deepseek_v41.py and the Rust renderer.
++                index = next(
++                    (
++                        position
++                        for position, message in enumerate(messages)
++                        if message.get("role") == "system"
++                    ),
++                    None,
++                )
++                if index is None:
++                    index = 0
++                    messages.insert(index, {"role": "system", "content": ""})
++                messages[index] = {
++                    **messages[index],
++                    "tools": tools,
++                }  # type: ignore[typeddict-unknown-key]
+ 
+             reasoning_effort = kwargs.get("reasoning_effort")
+             if not isinstance(reasoning_effort, str):

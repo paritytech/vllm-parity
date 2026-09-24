@@ -40,10 +40,93 @@ PLOT_LEFT = MARGIN_LEFT
 PLOT_RIGHT = WIDTH - MARGIN_RIGHT
 PLOT_BOTTOM = MARGIN_TOP + PLOT_HEIGHT
 
-REQUEST_SUCCESS = "vllm:request_success_total"
 MAX_REASON_SLOTS = 4
 LABEL_CLEARANCE = 14
 DURATION_UNITS = ((1.0, "s"), (1e3, "ms"), (1e6, "µs"))
+
+
+# --- Engines ------------------------------------------------------------------------
+
+# vLLM and SGLang measure the same run under different names, so every series this report
+# reads is looked up here rather than spelled out where it is used. Two of them are not
+# renames and are handled separately below: how many tokens the KV cache holds, and the
+# acceptance length under speculative decoding.
+#
+# `finished_label` is the label the completion counter is broken down by. vLLM says why
+# each request ended; SGLang's counter carries no such breakdown, so that chart is a
+# single line rather than one per reason.
+ENGINES = {
+    "vllm": {
+        "generation_tokens": "vllm:generation_tokens_total",
+        "prompt_tokens": "vllm:prompt_tokens_total",
+        "requests_running": "vllm:num_requests_running",
+        "requests_waiting": "vllm:num_requests_waiting",
+        "time_to_first_token": "vllm:time_to_first_token_seconds",
+        "inter_token_latency": "vllm:inter_token_latency_seconds",
+        "queue_time": "vllm:request_queue_time_seconds",
+        "e2e_latency": "vllm:e2e_request_latency_seconds",
+        "kv_cache_usage": "vllm:kv_cache_usage_perc",
+        "preemptions": "vllm:num_preemptions_total",
+        "prefix_cache_hits": "vllm:prefix_cache_hits_total",
+        "prefix_cache_queries": "vllm:prefix_cache_queries_total",
+        "finished": "vllm:request_success_total",
+        "finished_label": "finished_reason",
+        "prompt_length": "vllm:request_prompt_tokens",
+        "generation_length": "vllm:request_generation_tokens",
+        "spec_drafts": "vllm:spec_decode_num_drafts_total",
+        "spec_accepted": "vllm:spec_decode_num_accepted_tokens_total",
+        "acceptance_length": None,
+        "kv_cache_size": None,
+        "block_size": None,
+    },
+    "sglang": {
+        "generation_tokens": "sglang:generation_tokens_total",
+        "prompt_tokens": "sglang:prompt_tokens_total",
+        "requests_running": "sglang:num_running_reqs",
+        "requests_waiting": "sglang:num_queue_reqs",
+        "time_to_first_token": "sglang:time_to_first_token_seconds",
+        "inter_token_latency": "sglang:inter_token_latency_seconds",
+        "queue_time": "sglang:queue_time_seconds",
+        "e2e_latency": "sglang:e2e_request_latency_seconds",
+        # Not `sglang:token_usage`, which is the same number rounded to two decimals and
+        # so reads as a flat zero until the cache is 1% full.
+        "kv_cache_usage": "sglang:full_token_usage",
+        # Retraction is SGLang's word for the same thing: a running request evicted and
+        # recomputed later. The gauge next to it counts what is retracted right now.
+        "preemptions": "sglang:num_retracted_requests_total",
+        # Prompt tokens served from cache over prompt tokens seen. vLLM counts block
+        # lookups instead, so the two hit rates are close but not the same measurement.
+        "prefix_cache_hits": "sglang:cached_tokens_total",
+        "prefix_cache_queries": "sglang:prompt_tokens_total",
+        "finished": "sglang:num_requests_total",
+        "finished_label": None,
+        "prompt_length": "sglang:prompt_tokens_histogram",
+        "generation_length": "sglang:generation_tokens_histogram",
+        # SGLang publishes the mean acceptance length itself rather than the draft and
+        # accepted-token counters it comes from, and states the pool sizes as gauges
+        # rather than in a config block, which vLLM has and it does not.
+        "spec_drafts": None,
+        "spec_accepted": None,
+        "acceptance_length": "sglang:spec_accept_length",
+        "kv_cache_size": "sglang:max_total_num_tokens",
+        "block_size": "sglang:page_size",
+    },
+}
+
+# Assigned once the file has been read, since which engine wrote it is only knowable then.
+metrics = ENGINES["vllm"]
+
+
+def detect_engine(records):
+    """Whichever engine's prefix the file's series carry. A run is one engine throughout:
+    the entrypoint archives the previous run's metrics before starting a new one."""
+    for record in records:
+        for section in ("gauges", "counters", "histograms"):
+            for key in record.get(section, {}):
+                name = key.split(":", 1)[0]
+                if name in ENGINES:
+                    return name
+    return "vllm"
 
 
 # --- Loading ------------------------------------------------------------------------
@@ -82,12 +165,26 @@ def gauge(key):
     return lambda record: record.get("gauges", {}).get(key)
 
 
+def series_total(counters, key):
+    """A counter's value, summing over its labels when it has any.
+
+    SGLang splits cached tokens by where they were served from -- GPU, host RAM, disk --
+    so the counter this report wants is spread over several keys and reading the bare
+    name finds nothing at all.
+    """
+    exact = counters.get(key)
+    if exact is not None:
+        return exact
+    prefix = key + "{"
+    return sum(value for name, value in counters.items() if name.startswith(prefix))
+
+
 def counter_rate(key):
     def extract(record):
         interval = record.get("interval_seconds")
         if not interval:
             return None
-        return record.get("counters", {}).get(key, 0.0) / interval
+        return series_total(record.get("counters", {}), key) / interval
 
     return extract
 
@@ -120,10 +217,10 @@ def counter_ratio(numerator, denominator, factor=100.0):
         counters = record.get("counters")
         if counters is None:
             return None
-        total = counters.get(denominator, 0.0)
+        total = series_total(counters, denominator)
         if not total:
             return None
-        return factor * counters.get(numerator, 0.0) / total
+        return factor * series_total(counters, numerator) / total
 
     return extract
 
@@ -196,7 +293,10 @@ class Chart:
 def finished_reason_series(records):
     """Reasons come from the data, so fix their order alphabetically: a series must not
     change colour just because a run happened to see a different mix of them."""
-    prefix = f"{REQUEST_SUCCESS}{{finished_reason="
+    if metrics["finished_label"] is None:
+        return [SeriesSpec("Finished", counter_rate(metrics["finished"]))]
+
+    prefix = f"{metrics['finished']}{{{metrics['finished_label']}="
     reasons = sorted(
         {
             key[len(prefix) : -1]
@@ -228,14 +328,14 @@ def chart_specs(records):
             "Generation throughput",
             "Output tokens per second: the decode work a caller is waiting on.",
             "tokens/s",
-            [SeriesSpec("Generation", counter_rate("vllm:generation_tokens_total"))],
+            [SeriesSpec("Generation", counter_rate(metrics["generation_tokens"]))],
         ),
         ChartSpec(
             "prefill",
             "Prompt throughput",
             "Prompt tokens processed per second. Spikes are long prompts being prefilled.",
             "tokens/s",
-            [SeriesSpec("Prompt", counter_rate("vllm:prompt_tokens_total"))],
+            [SeriesSpec("Prompt", counter_rate(metrics["prompt_tokens"]))],
         ),
         ChartSpec(
             "finished",
@@ -250,8 +350,8 @@ def chart_specs(records):
             "Requests waiting is the signal that the GPU is saturated rather than merely slow.",
             "requests",
             [
-                SeriesSpec("Running", gauge("vllm:num_requests_running")),
-                SeriesSpec("Waiting", gauge("vllm:num_requests_waiting")),
+                SeriesSpec("Running", gauge(metrics["requests_running"])),
+                SeriesSpec("Waiting", gauge(metrics["requests_waiting"])),
             ],
         ),
         ChartSpec(
@@ -260,8 +360,8 @@ def chart_specs(records):
             "Arrival to first token, queueing included.",
             "s",
             [
-                SeriesSpec("Mean", histogram_stat("vllm:time_to_first_token_seconds", "mean")),
-                SeriesSpec("p90", histogram_stat("vllm:time_to_first_token_seconds", "p90")),
+                SeriesSpec("Mean", histogram_stat(metrics["time_to_first_token"], "mean")),
+                SeriesSpec("p90", histogram_stat(metrics["time_to_first_token"], "p90")),
             ],
             duration=True,
         ),
@@ -273,8 +373,8 @@ def chart_specs(records):
             "over several tokens at once -- see 'mean tokens per step'.",
             "s",
             [
-                SeriesSpec("Mean", histogram_stat("vllm:inter_token_latency_seconds", "mean")),
-                SeriesSpec("p90", histogram_stat("vllm:inter_token_latency_seconds", "p90")),
+                SeriesSpec("Mean", histogram_stat(metrics["inter_token_latency"], "mean")),
+                SeriesSpec("p90", histogram_stat(metrics["inter_token_latency"], "p90")),
             ],
             duration=True,
         ),
@@ -283,7 +383,7 @@ def chart_specs(records):
             "Queue time",
             "Time spent waiting for a scheduler slot, before any work began.",
             "s",
-            [SeriesSpec("Mean", histogram_stat("vllm:request_queue_time_seconds", "mean"))],
+            [SeriesSpec("Mean", histogram_stat(metrics["queue_time"], "mean"))],
             duration=True,
         ),
         ChartSpec(
@@ -292,8 +392,8 @@ def chart_specs(records):
             "Arrival to final token, across the whole request.",
             "s",
             [
-                SeriesSpec("Mean", histogram_stat("vllm:e2e_request_latency_seconds", "mean")),
-                SeriesSpec("p90", histogram_stat("vllm:e2e_request_latency_seconds", "p90")),
+                SeriesSpec("Mean", histogram_stat(metrics["e2e_latency"], "mean")),
+                SeriesSpec("p90", histogram_stat(metrics["e2e_latency"], "p90")),
             ],
             duration=True,
         ),
@@ -302,7 +402,7 @@ def chart_specs(records):
             "KV cache usage",
             "Cache pressure. Sustained high usage is what precedes preemption.",
             "%",
-            [SeriesSpec("KV cache", scaled(gauge("vllm:kv_cache_usage_perc"), 100.0))],
+            [SeriesSpec("KV cache", scaled(gauge(metrics["kv_cache_usage"]), 100.0))],
         ),
         ChartSpec(
             "prefix",
@@ -313,7 +413,7 @@ def chart_specs(records):
                 SeriesSpec(
                     "Hit rate",
                     counter_ratio(
-                        "vllm:prefix_cache_hits_total", "vllm:prefix_cache_queries_total"
+                        metrics["prefix_cache_hits"], metrics["prefix_cache_queries"]
                     ),
                 )
             ],
@@ -323,7 +423,7 @@ def chart_specs(records):
             "Preemptions",
             "Requests evicted and recomputed. This is what a too-small KV cache looks like.",
             "/s",
-            [SeriesSpec("Preemptions", counter_rate("vllm:num_preemptions_total"))],
+            [SeriesSpec("Preemptions", counter_rate(metrics["preemptions"]))],
         ),
         ChartSpec(
             "gpu",
@@ -513,8 +613,16 @@ def run_info(records):
     return next((record["info"] for record in records if record.get("info")), {})
 
 
-def kv_cache_tokens(info):
-    size = info.get("vllm:cache_config_info", {}).get("kv_cache_size_tokens")
+def kv_cache_tokens(info, records=()):
+    """How many tokens the KV cache holds, which the capacity table is built from.
+
+    vLLM states it once in its config info block; SGLang has no such block and reports
+    it as a gauge on every sample instead.
+    """
+    if metrics["kv_cache_size"]:
+        size = peak_gauge(records, metrics["kv_cache_size"])
+    else:
+        size = info.get("vllm:cache_config_info", {}).get("kv_cache_size_tokens")
     try:
         return int(float(size))
     except (TypeError, ValueError):
@@ -572,16 +680,16 @@ def load_profile(records):
     bins = {}
     for record in records:
         interval = record.get("interval_seconds")
-        running = record.get("gauges", {}).get("vllm:num_requests_running")
+        running = record.get("gauges", {}).get(metrics["requests_running"])
         if not interval or not running or running < 1:
             continue
         entry = bins.setdefault(concurrency_bin(running), {"rates": [], "decode": []})
 
-        tokens = record.get("counters", {}).get("vllm:generation_tokens_total", 0.0)
+        tokens = record.get("counters", {}).get(metrics["generation_tokens"], 0.0)
         if tokens > 0:
             entry["rates"].append(tokens / interval)
 
-        latency = record.get("histograms", {}).get("vllm:inter_token_latency_seconds", {})
+        latency = record.get("histograms", {}).get(metrics["inter_token_latency"], {})
         if tokens > 0 and latency.get("sum"):
             entry["decode"].append(tokens / latency["sum"])
     return bins
@@ -593,10 +701,21 @@ def acceptance_length(records):
     Worth reporting on its own: it is both the speedup the drafter is buying and the
     factor by which any steps-per-second figure understates tokens per second.
     """
-    drafts = sum_counter(records, "vllm:spec_decode_num_drafts_total")
+    if metrics["acceptance_length"]:
+        # Already a mean, and reported as zero whenever nothing was speculated, so the
+        # zeros are dropped rather than averaged in. This weights every sample equally
+        # instead of by the tokens it covered.
+        observed = [
+            record["gauges"][metrics["acceptance_length"]]
+            for record in records
+            if record.get("gauges", {}).get(metrics["acceptance_length"])
+        ]
+        return sum(observed) / len(observed) if observed else None
+
+    drafts = sum_counter(records, metrics["spec_drafts"])
     if not drafts:
         return None
-    return 1 + sum_counter(records, "vllm:spec_decode_num_accepted_tokens_total") / drafts
+    return 1 + sum_counter(records, metrics["spec_accepted"]) / drafts
 
 
 def per_request_decode_rate(records):
@@ -607,12 +726,12 @@ def per_request_decode_rate(records):
     intervals cannot drag it around.
     """
     seconds = sum(
-        record.get("histograms", {}).get("vllm:inter_token_latency_seconds", {}).get("sum", 0.0)
+        record.get("histograms", {}).get(metrics["inter_token_latency"], {}).get("sum", 0.0)
         for record in records
     )
     if not seconds:
         return None
-    return sum_counter(records, "vllm:generation_tokens_total") / seconds
+    return sum_counter(records, metrics["generation_tokens"]) / seconds
 
 
 def concurrency_time(records):
@@ -625,7 +744,7 @@ def concurrency_time(records):
     seconds = {}
     for record in records:
         interval = record.get("interval_seconds")
-        running = record.get("gauges", {}).get("vllm:num_requests_running")
+        running = record.get("gauges", {}).get(metrics["requests_running"])
         if not interval or running is None:
             continue
         edge = 0 if running < 1 else concurrency_bin(running)
@@ -647,7 +766,7 @@ def median(values):
 
 
 def sum_counter(records, key):
-    return sum(record.get("counters", {}).get(key, 0.0) for record in records)
+    return sum(series_total(record.get("counters", {}), key) for record in records)
 
 
 def sum_counter_prefix(records, prefix):
@@ -694,10 +813,10 @@ def status_totals(records):
 
 def summarise(records, prompts, generations, latency):
     measured = sum(record.get("interval_seconds", 0.0) for record in records)
-    generation = sum_counter(records, "vllm:generation_tokens_total")
-    prompt = sum_counter(records, "vllm:prompt_tokens_total")
-    queries = sum_counter(records, "vllm:prefix_cache_queries_total")
-    hits = sum_counter(records, "vllm:prefix_cache_hits_total")
+    generation = sum_counter(records, metrics["generation_tokens"])
+    prompt = sum_counter(records, metrics["prompt_tokens"])
+    queries = sum_counter(records, metrics["prefix_cache_queries"])
+    hits = sum_counter(records, metrics["prefix_cache_hits"])
     occupancy = mean_of(records, gpu_stat("utilization_percent"))
     acceptance = acceptance_length(records)
     decode_rate = per_request_decode_rate(records)
@@ -706,11 +825,11 @@ def summarise(records, prompts, generations, latency):
     failed = sum(count for status, count in statuses.items() if not status.startswith("2"))
 
     workload = [
-        ("Requests finished", format_number(sum_counter_prefix(records, REQUEST_SUCCESS)), ""),
+        ("Requests finished", format_number(sum_counter_prefix(records, metrics["finished"])), ""),
         ("Request error rate", f"{100 * failed / served:.2f}" if served else "--",
          "%" if served else ""),
         ("Peak concurrent requests",
-         format_number(peak_gauge(records, "vllm:num_requests_running")), ""),
+         format_number(peak_gauge(records, metrics["requests_running"])), ""),
         ("Median prompt tokens", format_tokens_value(distribution_quantile(*prompts, 0.5)), ""),
         ("p99 prompt tokens", format_tokens_value(distribution_quantile(*prompts, 0.99)), ""),
         ("Longest prompt seen", largest_observed(*prompts), ""),
@@ -723,22 +842,22 @@ def summarise(records, prompts, generations, latency):
         ("Prompt tokens", format_number(prompt), ""),
         ("Generation tokens", format_number(generation), ""),
         ("Mean time to first token", format_duration_value(
-            histogram_mean(records, "vllm:time_to_first_token_seconds")), ""),
+            histogram_mean(records, metrics["time_to_first_token"])), ""),
         ("p99 time to first token",
          format_duration_value(distribution_quantile(*latency, 0.99)), ""),
         ("Mean inter-token latency", format_duration_value(
-            histogram_mean(records, "vllm:inter_token_latency_seconds")), ""),
+            histogram_mean(records, metrics["inter_token_latency"])), ""),
         ("Mean tokens per step", f"{acceptance:.2f}" if acceptance is not None else "--", ""),
         ("Mean per-request decode rate",
          f"{decode_rate:.0f}" if decode_rate is not None else "--",
          "tok/s" if decode_rate is not None else ""),
         ("Mean queue time", format_duration_value(
-            histogram_mean(records, "vllm:request_queue_time_seconds")), ""),
+            histogram_mean(records, metrics["queue_time"])), ""),
         ("Peak KV cache usage",
-         format_percent(peak_gauge(records, "vllm:kv_cache_usage_perc", 100)), ""),
+         format_percent(peak_gauge(records, metrics["kv_cache_usage"], 100)), ""),
         ("Peak requests waiting",
-         format_number(peak_gauge(records, "vllm:num_requests_waiting")), ""),
-        ("Preemptions", format_number(sum_counter(records, "vllm:num_preemptions_total")), ""),
+         format_number(peak_gauge(records, metrics["requests_waiting"])), ""),
+        ("Preemptions", format_number(sum_counter(records, metrics["preemptions"])), ""),
         ("Mean GPU occupancy", f"{occupancy:.0f}" if occupancy is not None else "--",
          "%" if occupancy is not None else ""),
     ]
@@ -1437,7 +1556,7 @@ def capacity_section(records, prompts):
     """The question this answers -- how many requests fit at a given context length --
     is arithmetic on the KV cache size, not something vLLM measures."""
     info = run_info(records)
-    capacity = kv_cache_tokens(info)
+    capacity = kv_cache_tokens(info, records)
     limit = context_limit(info)
     if not capacity or not limit:
         return ""
@@ -1480,14 +1599,22 @@ def capacity_section(records, prompts):
 
 
 def config_notes(records):
-    """A few facts about the server the run happened on, taken from the info block."""
+    """A few facts about the server the run happened on. vLLM states them in its config
+    info block; SGLang has no such block, so the same facts come off its gauges."""
     info = next((record["info"] for record in records if record.get("info")), {})
     cache = info.get("vllm:cache_config_info", {})
     notes = []
-    if cache.get("kv_cache_size_tokens"):
-        notes.append(f'<span>KV cache <b>{format_number(float(cache["kv_cache_size_tokens"]))} tokens</b></span>')
-    if cache.get("block_size"):
+
+    capacity = kv_cache_tokens(info, records)
+    if capacity:
+        notes.append(f"<span>KV cache <b>{format_number(capacity)} tokens</b></span>")
+
+    block_size = peak_gauge(records, metrics["block_size"]) if metrics["block_size"] else None
+    if block_size:
+        notes.append(f"<span>Block size <b>{block_size:.0f}</b></span>")
+    elif cache.get("block_size"):
         notes.append(f'<span>Block size <b>{html.escape(cache["block_size"])}</b></span>')
+
     if cache.get("enable_prefix_caching"):
         enabled = cache["enable_prefix_caching"] == "True"
         notes.append(f'<span>Prefix caching <b>{"on" if enabled else "off"}</b></span>')
@@ -1637,6 +1764,10 @@ def main():
     args = parser.parse_args()
 
     records = load_records(args.input)
+
+    global metrics
+    metrics = ENGINES[detect_engine(records)]
+
     bounds = bucket_bounds(len(records), max(1, args.buckets))
     xs, stamps, breaks = bucket_axis(records, bounds)
 
@@ -1648,16 +1779,16 @@ def main():
     if not charts:
         raise SystemExit(f"{args.input}: no plottable series")
 
-    prompts = distribution(records, "vllm:request_prompt_tokens")
-    generations = distribution(records, "vllm:request_generation_tokens")
-    latency = distribution(records, "vllm:time_to_first_token_seconds")
+    prompts = distribution(records, metrics["prompt_length"])
+    generations = distribution(records, metrics["generation_length"])
+    latency = distribution(records, metrics["time_to_first_token"])
     profile = load_profile(records)
 
     bars = [
         chart
         for chart in (
             distribution_bars(
-                "vllm:request_prompt_tokens",
+                metrics["prompt_length"],
                 "Prompt length distribution",
                 "Context actually used, by request. Bars are vLLM's own bucket upper bounds, "
                 "which stop at 200K -- anything longer only shows as the final bar.",
@@ -1665,7 +1796,7 @@ def main():
                 "dist-prompt",
             ),
             distribution_bars(
-                "vllm:request_generation_tokens",
+                metrics["generation_length"],
                 "Generation length distribution",
                 "How much each request actually produced.",
                 records,

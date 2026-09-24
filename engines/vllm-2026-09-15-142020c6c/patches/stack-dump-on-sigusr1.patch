@@ -1,0 +1,20 @@
+--- a/vllm/__init__.py
++++ b/vllm/__init__.py
+@@ -6,6 +6,8 @@
+ # version library first.  Such assumption is critical for some customization.
+ from .version import __version__, __version_tuple__  # isort:skip
+ 
++import faulthandler
++import signal
+ import typing
+ 
+ # The environment variables override should be imported before any other
+@@ -13,6 +15,8 @@
+ # other modules are imported.
+ import vllm.env_override  # noqa: F401
+ 
++faulthandler.register(signal.SIGUSR1, all_threads=True)
++
+ MODULE_ATTRS = {
+     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",
+     "EngineArgs": ".engine.arg_utils:EngineArgs",

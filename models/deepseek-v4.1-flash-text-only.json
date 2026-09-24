@@ -1,0 +1,8 @@
+{
+  "extends": "deepseek-v4.1-flash",
+  "engine_args": {
+    "vllm": {
+      "args": {"--language-model-only": true}
+    }
+  }
+}

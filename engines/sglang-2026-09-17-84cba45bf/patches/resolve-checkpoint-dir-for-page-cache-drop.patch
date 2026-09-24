@@ -1,0 +1,40 @@
+--- a/sglang/srt/layers/engram.py
++++ b/sglang/srt/layers/engram.py
+@@ -532,6 +532,26 @@
+ _page_cache_dropped = False
+ 
+ 
++def _checkpoint_dir(model_path: str) -> str:
++    """The directory the safetensors are in.
++
++    ``--model-path`` is a repo id whenever the server downloads its own weights, and the
++    files then live in the HF cache under ``--download-dir``, where globbing the repo id
++    matches nothing.
++    """
++    if os.path.isdir(model_path):
++        return model_path
++    from sglang.srt.model_loader.weight_utils import (
++        _find_local_hf_snapshot_dir_unlocked,
++    )
++
++    model = get_model()
++    snapshot = _find_local_hf_snapshot_dir_unlocked(
++        model_path, model.download_dir, ["*.safetensors"], model.revision
++    )
++    return snapshot or model_path
++
++
+ def drop_checkpoint_page_cache(model_path: Optional[str] = None) -> tuple[int, int]:
+     """Drop checkpoint page cache with posix_fadvise(DONTNEED); return (files, bytes).
+ 
+@@ -544,6 +564,10 @@
+         except (ValueError, AttributeError):
+             # No published runtime context (unit tests, offline tools): nothing to drop.
+             return 0, 0
++    try:
++        model_path = _checkpoint_dir(model_path)
++    except (ValueError, AttributeError, OSError):
++        return 0, 0
+     files, nbytes = 0, 0
+     for f in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+         try:

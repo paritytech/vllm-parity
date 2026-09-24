@@ -1,0 +1,51 @@
+{
+  "hf_repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "trust_remote_code": true,
+  "chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"},
+  "generation_config": {"top_p": 0.95},
+  "gpu_memory": {"startup_headroom_gib": 18, "max_utilization": 0.92},
+  "parallelism": {
+    "weights_gib": 159,
+    "runtime_overhead_gib": 10,
+    "min_kv_cache_gib": 11,
+    "expert_parallel": true
+  },
+  "default_engine": "vllm-0.26.0",
+  "validated_engines": ["vllm-0.26.0"],
+  "engine_args": {
+    "vllm": {
+      "args": {
+        "--load-format": "fastsafetensors",
+        "--enable-auto-tool-choice": true,
+        "--tokenizer-mode": "deepseek_v4",
+        "--tool-call-parser": "deepseek_v4",
+        "--reasoning-parser": "deepseek_v4",
+        "--kv-cache-dtype": "fp8",
+        "--block-size": 256,
+        "--max-num-seqs": 64,
+        "--max-num-batched-tokens": 8192,
+        "--long-prefill-token-threshold": 2048,
+        "--speculative-config": {
+          "method": "dspark",
+          "num_speculative_tokens": 7,
+          "draft_sample_method": "probabilistic"
+        },
+        "--compilation-config": {"cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"]}
+      },
+      "blackwell_args": {"--attention_config.use_fp4_indexer_cache": "True"}
+    },
+    "sglang": {
+      "args": {
+        "--load-format": "fastsafetensors",
+        "--tool-call-parser": "deepseekv4",
+        "--reasoning-parser": "deepseek-v4",
+        "--kv-cache-dtype": "fp8_e4m3",
+        "--page-size": 256,
+        "--max-running-requests": 64,
+        "--chunked-prefill-size": 8192,
+        "--speculative-algorithm": "DSPARK"
+      },
+      "blackwell_args": {"--enable-deepseek-v4-fp4-indexer": true}
+    }
+  }
+}

@@ -1,0 +1,14 @@
+[project]
+name = "sglang-workspace"
+version = "0.1.0"
+description = ""
+authors = []
+dependencies = [
+    "sglang @ git+https://github.com/sgl-project/sglang@84cba45bf1553f7e6b9c8cabf9969a4840942b7b#subdirectory=python",
+    "fastsafetensors",
+]
+
+requires-python = "== 3.12.10"
+
+[tool.uv]
+prerelease = "allow"

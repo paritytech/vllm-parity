@@ -1,0 +1,9 @@
+{
+  "hf_repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "kv_cache_offload": false,
+  "validated_engines": [],
+  "engine_args": {
+    "vllm": {"args": {"--load-format": "fastsafetensors"}},
+    "sglang": {"args": {"--load-format": "fastsafetensors"}}
+  }
+}

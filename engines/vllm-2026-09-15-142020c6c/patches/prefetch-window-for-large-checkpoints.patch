@@ -1,0 +1,142 @@
+--- a/vllm/config/load.py
++++ b/vllm/config/load.py
+@@ -11,7 +11,10 @@
+ 
+ DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS = 8
+ DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024
+-SafetensorsLoadStrategy: TypeAlias = Literal["lazy", "eager", "prefetch", "torchao"]
++DEFAULT_SAFETENSORS_PREFETCH_MAX_BYTES = 64 * 1024**3
++SafetensorsLoadStrategy: TypeAlias = Literal[
++    "lazy", "eager", "prefetch", "prefetch_window", "torchao"
++]
+ 
+ if TYPE_CHECKING:
+     from vllm.model_executor.model_loader import LoadFormats
+@@ -80,6 +83,12 @@
+     - "prefetch": Checkpoint files are read into the OS page cache before
+       workers load them, speeding up the model loading phase. Useful on
+       network or high-latency storage.
++    - "prefetch_window": The same reads, kept to the files the loader is about
++      to reach rather than the whole checkpoint, bounded by
++      `safetensors_prefetch_num_threads` files and
++      `safetensors_prefetch_max_bytes` bytes. Use for a checkpoint larger than
++      the page cache, where "prefetch" reads pages that are evicted before the
++      loader arrives.
+     - "torchao": Weights are loaded in upfront and then reconstructed
+       into torchao tensor subclasses. This is used when the checkpoint
+       was quantized using torchao and saved using safetensors.
+@@ -94,6 +103,11 @@
+         default=DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE, ge=1
+     )
+     """Read size in bytes for each safetensors checkpoint file prefetch."""
++    safetensors_prefetch_max_bytes: int = Field(
++        default=DEFAULT_SAFETENSORS_PREFETCH_MAX_BYTES, ge=1
++    )
++    """Bytes of checkpoint the "prefetch_window" strategy may hold in the page
++    cache ahead of the loader. One shard larger than this is still read whole."""
+     model_loader_extra_config: dict | TensorizerConfig = Field(default_factory=dict)
+     """Extra config for model loader. This will be passed to the model loader
+     corresponding to the chosen load_format."""
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -295,6 +295,9 @@
+                         safetensors_prefetch_block_size=(
+                             self.load_config.safetensors_prefetch_block_size
+                         ),
++                        safetensors_prefetch_max_bytes=(
++                            self.load_config.safetensors_prefetch_max_bytes
++                        ),
+                     )
+         else:
+             if extra_config.get("enable_multithread_load"):
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -31,6 +31,7 @@
+ from vllm.config import ModelConfig
+ from vllm.config.load import (
+     DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
++    DEFAULT_SAFETENSORS_PREFETCH_MAX_BYTES,
+     DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+     LoadConfig,
+ )
+@@ -788,6 +789,51 @@
+             pass
+ 
+ 
++def _prefetch_window(
++    sorted_files: list[str],
++    window: int,
++    block_size: int,
++    max_bytes: int,
++) -> Generator[str, None, None]:
++    """Yield checkpoint files, keeping the ones the loader is about to reach in the page cache.
++
++    The loader faults its weights in one tensor at a time, between host-to-device copies, so a
++    shard is read at the rate of a single thread that stops on every copy. The reads here run on
++    `window` threads that do not stop, ahead of the file being loaded, which is both parallel and
++    overlapped with the copies. Unlike a prefetch of the whole checkpoint, the read-ahead is
++    bounded -- by `window` files and by `max_bytes` -- so a checkpoint larger than the page cache
++    is not read into pages that are evicted before the loader arrives. A shard larger than
++    `max_bytes` on its own is still read whole, since the loader is about to read it anyway.
++    """
++    sizes = [os.path.getsize(path) for path in sorted_files]
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=window) as pool:
++        reads: dict[int, concurrent.futures.Future] = {}
++        queued_bytes = 0
++        next_file = 0
++
++        for index, path in enumerate(sorted_files):
++            while (
++                next_file < len(sorted_files)
++                and len(reads) < window
++                and (not reads or queued_bytes + sizes[next_file] <= max_bytes)
++            ):
++                reads[next_file] = pool.submit(
++                    _prefetch_checkpoint, sorted_files[next_file], block_size
++                )
++                queued_bytes += sizes[next_file]
++                next_file += 1
++
++            queued_bytes -= sizes[index]
++            try:
++                reads.pop(index).result()
++            except Exception:
++                logger.warning(
++                    "Failed to prefetch checkpoint file %r.", path, exc_info=True
++                )
++            yield path
++
++
+ def _prefetch_all_checkpoints(
+     sorted_files: list[str],
+     num_prefetch_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+@@ -871,6 +917,7 @@
+     *,
+     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
++    safetensors_prefetch_max_bytes: int = DEFAULT_SAFETENSORS_PREFETCH_MAX_BYTES,
+ ) -> Generator[tuple[str, torch.Tensor], None, None]:
+     """Iterate over the weights in the model safetensor files.
+ 
+@@ -948,9 +995,19 @@
+             block_size=safetensors_prefetch_block_size,
+         )
+ 
++    file_stream: Iterable[str] = sorted_files
++    if safetensors_load_strategy == "prefetch_window":
++        file_stream = _prefetch_window(
++            sorted_files,
++            window=safetensors_prefetch_num_threads,
++            block_size=safetensors_prefetch_block_size,
++            max_bytes=safetensors_prefetch_max_bytes,
++        )
++
+     leftover_state_dict: dict[str, torch.Tensor] = {}
+     for st_file in tqdm(
+-        sorted_files,
++        file_stream,
++        total=len(sorted_files),
+         desc=loading_desc,
+         disable=not enable_tqdm(use_tqdm_on_load),
+         bar_format=_BAR_FORMAT,

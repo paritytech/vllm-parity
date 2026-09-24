@@ -1,2 +1,4 @@
 .git
-.venv
+.agent
+**/.venv
+**/__pycache__

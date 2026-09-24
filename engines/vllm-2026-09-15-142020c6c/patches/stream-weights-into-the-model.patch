@@ -1,0 +1,106 @@
+--- a/vllm/models/deepseek_v41/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py
+@@ -16,6 +16,7 @@
+   (``requires_raw_input_tokens``).
+ """
+ 
++import time
+ from collections.abc import Iterable
+ from typing import Annotated
+ 
+@@ -23,6 +24,7 @@
+ from torch import nn
+ 
+ from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.logger import init_logger
+ from vllm.model_executor.models.interfaces import (
+     MultiModalEmbeddings,
+     SupportsEagle3,
+@@ -60,6 +62,65 @@
+ )
+ 
+ 
++logger = init_logger(__name__)
++
++GIB = 1 << 30
++LANGUAGE_MODEL_PREFIX = "language_model."
++WEIGHT_PROGRESS_INTERVAL_S = 10.0
++
++
++def _contiguous_weight_groups(weights: Iterable[tuple[str, torch.Tensor]]) -> Iterable[tuple[str, torch.Tensor]]:
++    """Stream the weights with every top-level group contiguous.
++
++    AutoWeightsLoader delegates one contiguous group at a time, and the child's load_weights
++    finalizes fused expert weights when its group ends, so the language model's weights have to
++    arrive as one run. Sorting the whole stream produced that run, at the cost of holding all 48
++    shards of a 475 GiB checkpoint alive at once: under fastsafetensors they are device tensors
++    and the GPU runs out of memory, and under the default loader every shard is mapped in one
++    pass and faulted back in during a second. The language model is the checkpoint minus the
++    vision tower, so it streams in checkpoint order and only the tower is buffered.
++    """
++    tail = []
++
++    for name, tensor in weights:
++        if name.startswith(LANGUAGE_MODEL_PREFIX):
++            yield name, tensor
++        else:
++            tail.append((name, tensor))
++
++    yield from sorted(tail, key=lambda item: item[0])
++
++
++def _weights_with_progress(weights: Iterable[tuple[str, torch.Tensor]]) -> Iterable[tuple[str, torch.Tensor]]:
++    """Report progress while the loader copies the weights into the model.
++
++    The checkpoint iterator's progress bar covers opening and mapping the shards. Every byte
++    moves here instead, in a step that has no output of its own and takes most of the startup.
++    """
++    start = time.perf_counter()
++    previous_report = start
++    count = 0
++    copied_bytes = 0
++
++    for name, tensor in weights:
++        now = time.perf_counter()
++        if now - previous_report >= WEIGHT_PROGRESS_INTERVAL_S:
++            previous_report = now
++            elapsed = now - start
++            logger.info(
++                "Loading weights into the model: %d tensors, %.2f GiB at %.2f GiB/s, %.0f s elapsed, next %s",
++                count, copied_bytes / GIB, copied_bytes / GIB / elapsed, elapsed, name,
++            )
++        yield name, tensor
++        count += 1
++        copied_bytes += tensor.nbytes
++
++    logger.info(
++        "Loaded %d tensors (%.2f GiB) into the model in %.0f s",
++        count, copied_bytes / GIB, time.perf_counter() - start,
++    )
++
++
+ class DeepseekV4VLImagePixelInputs(TensorSchema):
+     """ViT patch inputs for one batched set of images.
+ 
+@@ -328,14 +389,14 @@
+         return self.language_model.get_mtp_target_hidden_states()
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        # Map HF names into this wrapper's namespace up front and sort, so
+-        # the "language_model." group reaches the child loader as one
+-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
+-        # and the child's load_weights finalizes fused expert weights, which
+-        # must not run on a partially loaded model).
+-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
++        # Map HF names into this wrapper's namespace up front, so the
++        # "language_model." group reaches the child loader as one contiguous
++        # block (AutoWeightsLoader delegates per contiguous group, and the
++        # child's load_weights finalizes fused expert weights, which must not
++        # run on a partially loaded model).
++        mapped = _contiguous_weight_groups(self.hf_to_vllm_mapper.apply(weights))
+         loader = AutoWeightsLoader(self)
+-        loaded_params = loader.load_weights(mapped)
++        loaded_params = loader.load_weights(_weights_with_progress(mapped))
+         # The child's load_weights already ran its post-load finalization.
+         self._weights_finalized = True
+         return loaded_params

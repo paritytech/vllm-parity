@@ -1,0 +1,120 @@
+--- a/sglang/srt/mem_cache/storage/file/lru_file_evictor.py
++++ b/sglang/srt/mem_cache/storage/file/lru_file_evictor.py
+@@ -27,6 +27,7 @@
+ import logging
+ import os
+ import threading
++import time
+ from collections import OrderedDict
+ from typing import Any, Callable, Optional, Set, Tuple
+ 
+@@ -35,6 +36,11 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Rounds of evict-then-re-probe a single write may drive before it is refused, and how often
++# a refusal is allowed to reach the log. See _enforce_free_space_locked and _warn_refusal.
++FREE_SPACE_ATTEMPTS = 3
++REFUSAL_LOG_INTERVAL_SECONDS = 60.0
++
+ 
+ def _parse_size_to_bytes(value: Any) -> int:
+     """Parse a size to bytes via human_readable_int (e.g. '200G', '1Gi', '1048576').
+@@ -87,6 +93,8 @@
+         self._pending_writes: Set[str] = set()
+         self._total_bytes: int = 0
+         self._lock = threading.Lock()
++        self._last_refusal_log: float = 0.0
++        self._refusals_suppressed: int = 0
+ 
+         self._load_config(extra_config or {})
+ 
+@@ -205,7 +213,7 @@
+             if self.min_free_bytes > 0 and not self._enforce_free_space_locked(
+                 value_bytes
+             ):
+-                logger.warning(
++                self._warn_refusal(
+                     f"HiCacheFile: filesystem hosting {self.file_path!r} "
+                     f"would fall below min_free={self.min_free_bytes} B "
+                     f"after writing {value_bytes} B; refusing {key} "
+@@ -275,25 +283,65 @@
+         free = st.f_bavail * st.f_frsize
+         return total, free
+ 
++    def _warn_refusal(self, message: str) -> None:
++        """Log a refused write, at most once every REFUSAL_LOG_INTERVAL_SECONDS.
++
++        A refusal is per file and a page backup writes one file per pool component, so a
++        filesystem sitting at the watermark produces thousands of these a minute, in which
++        state the interesting number is how many rather than which key. Caller holds _lock.
++        """
++        now = time.monotonic()
++        if now - self._last_refusal_log < REFUSAL_LOG_INTERVAL_SECONDS:
++            self._refusals_suppressed += 1
++            return
++        if self._refusals_suppressed:
++            message += (
++                f" ({self._refusals_suppressed} further refusals in the last "
++                f"{now - self._last_refusal_log:.0f}s)"
++            )
++        self._last_refusal_log = now
++        self._refusals_suppressed = 0
++        logger.warning(message)
++
+     def _enforce_free_space_locked(self, value_bytes: int) -> bool:
+         """Evict until writing value_bytes still leaves min_free_bytes free.
+-        Caller holds _lock. Returns False if the write can't be satisfied."""
++        Caller holds _lock. Returns False if the write can't be satisfied.
++
++        The first round overshoots the watermark by the same fraction the cap path leaves
++        below its cap, and each round re-probes instead of trusting the snapshot it started
++        from. Both matter once a filesystem is parked at the watermark. Evicting exactly the
++        deficit leaves the next write facing the same edge, so every write pays an eviction;
++        and a filesystem's free count trails its own unlinks -- a journal commit, delayed
++        allocation, a write still in flight -- so a verify taken immediately after those
++        unlinks can refuse a write whose victims are already gone, which is the one outcome
++        worse than either alternative: the old pages are lost and the new page is dropped
++        too. Overshooting turns that into one burst per slack, and re-probing lets a later
++        round admit the write the burst made room for.
++
++        A round that evicts nothing ends it: that is the honest "nothing left to give", and
++        it is also what keeps this bounded when the space is held by files the evictor does
++        not own.
++        """
+         if self.min_free_bytes <= 0:
+             return True
++        required = self.min_free_bytes + value_bytes
++        slack = int(self.min_free_bytes * (1.0 - self.eviction_ratio))
++        for attempt in range(FREE_SPACE_ATTEMPTS):
++            fs = self._fs_stats()
++            if fs is None:
++                return True  # cannot probe -> permissive, fall back to OS errors
++            if fs[1] >= required:
++                return True
++            target = required + slack if attempt == 0 else required
++            entries = len(self._lru)
++            # tmpfs frees space on unlink, so credit reclaimed bytes back to the
++            # estimate rather than re-probing statvfs on every eviction.
++            free = fs[1]
++            self._evict_while(lambda reclaimed, free=free: free + reclaimed < target)
++            if len(self._lru) == entries:
++                return False
+         fs = self._fs_stats()
+-        if fs is None:
+-            return True  # cannot probe -> permissive, fall back to OS errors
+-        # tmpfs frees space on unlink, so credit reclaimed bytes back to the
+-        # estimate rather than re-probing statvfs on every eviction.
+-        free = fs[1]
+-        self._evict_while(
+-            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+-        )
+-        # Re-probe: external writers may have changed free space meanwhile.
+-        fs = self._fs_stats()
+-        if fs is None:
+-            return True
+-        return fs[1] - value_bytes >= self.min_free_bytes
++        return fs is None or fs[1] >= required
+ 
+     def _scan_existing_files(self) -> None:
+         """Seed LRU index from disk on startup (oldest mtime first)."""

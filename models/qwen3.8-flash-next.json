@@ -1,0 +1,23 @@
+{
+  "hf_repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+  "gpu_memory": {"startup_headroom_gib": 18, "max_utilization": 0.90},
+  "parallelism": {
+    "weights_gib": 173,
+    "runtime_overhead_gib": 10,
+    "min_kv_cache_gib": 24
+  },
+  "default_engine": "vllm-0.29.0",
+  "validated_engines": [],
+  "engine_args": {
+    "vllm": {
+      "args": {
+        "--load-format": "fastsafetensors",
+        "--enable-auto-tool-choice": true,
+        "--tool-call-parser": "qwen3_xml",
+        "--reasoning-parser": "qwen3",
+        "--max-num-seqs": 256,
+        "--no-enable-flashinfer-autotune": true
+      }
+    }
+  }
+}

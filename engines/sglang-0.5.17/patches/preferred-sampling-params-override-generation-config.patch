@@ -1,0 +1,15 @@
+--- a/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -228,6 +228,12 @@
+         self.default_sampling_params = (
+             self.tokenizer_manager.model_config.get_default_sampling_params()
+         )
++        preferred_sampling_params = self.tokenizer_manager.server_args.preferred_sampling_params
++        if preferred_sampling_params:
++            self.default_sampling_params = {
++                **self.default_sampling_params,
++                **preferred_sampling_params,
++            }
+         if (
+             self.default_sampling_params
+             and not OpenAIServingChat._default_sampling_params_logged

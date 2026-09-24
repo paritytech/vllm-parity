@@ -29,10 +29,6 @@ written as zero, so an idle server costs a short line. Read a missing key as zer
 Bucket counts roughly double a busy line, to ~1.5 kB. At one sample a second that is
 ~120 MB a day, so for a long-running deployment prefer `--interval 5`; nothing in the
 capacity analysis depends on second-by-second resolution.
-
-The `model_name` and `engine` labels are aggregated away, since this serves one model
-and data-parallel engines are one pool. Every other label is kept, so a series prints
-as `vllm:request_success_total{finished_reason=stop}`.
 """
 
 import argparse
@@ -54,7 +50,20 @@ DEFAULT_URL = "http://127.0.0.1:9001/metrics"
 DEFAULT_OUTPUT = "/workspace/metrics.jsonl"
 
 QUANTILES = (0.5, 0.9, 0.99)
-COLLAPSED_LABELS = frozenset({"model_name", "engine"})
+COLLAPSED_LABELS = frozenset(
+    {
+        "model_name",
+        "engine",
+        "engine_type",
+        "priority",
+        "is_streaming",
+        "pid",
+        "tp_rank",
+        "pp_rank",
+        "moe_ep_rank",
+        "dp_rank",
+    }
+)
 STRUCTURAL_LABELS = frozenset({"le", "quantile"})
 ESCAPES = {"n": "\n", "\\": "\\", '"': '"'}
 
@@ -188,8 +197,20 @@ def series_key(name, labels):
     return name + "{" + ",".join(f"{key}={kept[key]}" for key in sorted(kept)) + "}"
 
 
+AVERAGED_GAUGES = frozenset(
+    {
+        "sglang:spec_accept_length",
+        "sglang:spec_block_accept_length",
+        "sglang:spec_cap_length",
+        "sglang:fwd_occupancy",
+        "sglang:eplb_balancedness",
+    }
+)
+
+
 def is_fraction(key):
-    return key.split("{", 1)[0].endswith(("_perc", "_ratio", "_rate"))
+    name = key.split("{", 1)[0]
+    return name.endswith(("_perc", "_ratio", "_rate", "_usage")) or name in AVERAGED_GAUGES
 
 
 def build_snapshot(families):
@@ -222,6 +243,8 @@ def build_snapshot(families):
 
         for name, labels, value in family.samples:
             if name.endswith("_created"):
+                continue
+            if family.kind != "counter" and labels.get("priority"):
                 continue
             key = series_key(name, labels)
             if family.kind == "counter":

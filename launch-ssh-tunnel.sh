@@ -74,6 +74,7 @@ while true; do
         -i "$KEY_FILE" \
         -R "${REMOTE_BIND_ADDRESS}:${REMOTE_PORT}:127.0.0.1:9001" \
         -o BatchMode=yes \
+        -o Compression=yes \
         -o IdentitiesOnly=yes \
         -o ExitOnForwardFailure=yes \
         -o ServerAliveInterval=15 \

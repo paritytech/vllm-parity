@@ -1,0 +1,13 @@
+--- a/vllm/v1/kv_offload/tiering/fs/io.py
++++ b/vllm/v1/kv_offload/tiering/fs/io.py
+@@ -88,6 +88,10 @@
+         bytes_read = os.readv(fd, [view_slice])
+         if bytes_read < block_size:
+             raise OSError(f"Short read: expected {block_size} bytes, read {bytes_read}")
++        try:
++            os.utime(fd)
++        except OSError:
++            pass
+     except Exception:
+         try:
+             os.remove(source_path)
